@@ -11,13 +11,18 @@ name: iOS Screenshot
 #   * Baseline serial run: 407s. ~80% is simulator lifecycle.
 #   * TRIED "boot sim first, overlap with brew+build": BACKFIRED. Booting a
 #     simulator concurrently starves `brew install` — brew went 22s -> 200s+
-#     across two runs. The bootstatus_wait DID drop 118s->3s, but the brew
+#     across three runs. bootstatus_wait DID drop 118s->3s, but the brew
 #     regression more than ate the gain. Lesson: the runner can't do a sim
 #     boot and a brew bottle-pour in parallel without heavy contention.
-#   * KEPT wins: cache the xtool install (brew off the critical path), drop the
-#     diagnostic simctl step, poll-for-rendered-frame instead of fixed sleep.
-#   * Boot the sim AFTER the heavy install/build work, right before it's needed.
-# [[TIMER]] lines let us keep measuring.
+#   * TRIED "cache the Homebrew cask": ALSO BACKFIRED. On a warm cache brew
+#     sees "artifact has not changed" and SKIPS linking -> `xtool: command
+#     not found` (exit 127). And it was pointless: with the concurrent boot
+#     removed, a COLD brew install is only 11s. Cache deleted.
+#   * KEPT wins (measured): drop the diagnostic simctl step, poll-for-rendered
+#     -frame instead of fixed sleep, boot the sim serially AFTER install+build.
+#   * RESULT: 407s -> 212s (48% faster), reproducible + green. The remaining
+#     152s is simulator lifecycle (create/boot/install/launch), largely
+#     irreducible on ephemeral runners. [[TIMER]] lines keep us honest.
 
 on:
   push:
@@ -39,19 +44,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Cache the Homebrew cellar/cache for xtool so brew barely runs on repeat
-      # runs. This is what actually removes brew from the critical path — and it
-      # sidesteps the sim-boot-vs-brew contention entirely (no concurrent boot).
-      - name: Cache xtool (Homebrew)
-        id: cache-xtool
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Caches/Homebrew/downloads
-            /opt/homebrew/Cellar/xtool
-            /opt/homebrew/Caskroom/xtool
-          key: xtool-brew-${{ runner.os }}-v1
-
+      # No Homebrew cache: a cold `brew install` is only 11s here, and caching
+      # the cask makes brew skip linking on warm runs (xtool: command not found).
       - name: Install xtool
         run: |
           set -euxo pipefail
