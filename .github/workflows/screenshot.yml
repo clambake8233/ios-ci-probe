@@ -7,6 +7,13 @@ name: iOS Screenshot
 #
 # Runs on GitHub-hosted macOS runners. On a PUBLIC repo (or a public fork),
 # these minutes are FREE.
+#
+# PERF (measured 2026-07-15): ~80% of wall-clock is simulator lifecycle
+# (boot-wait + install + launch), not real work. Optimization applied:
+#   A. Boot the sim FIRST (returns in ~3s), then overlap brew+build with the
+#      OS warming up in the CoreSimulator daemon (persists across steps).
+#   C. No separate diagnostic simctl step (early boot pays cold-start once).
+# [[TIMER]] lines let us re-measure the real gain vs. the 407s baseline.
 
 on:
   push:
@@ -21,23 +28,29 @@ jobs:
   screenshot:
     runs-on: macos-15     # macOS runner ships Xcode + simulators preinstalled
     timeout-minutes: 30
+    env:
+      BUNDLE_ID: com.example.ScreenshotProbe
+      DEVICE: iPhone 16 Pro
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode + simulator runtimes
+      # A: kick the simulator boot off IMMEDIATELY. `boot` returns in ~3s; the
+      # OS keeps warming in the background daemon while brew+build run. This is
+      # the first simctl call, so it also absorbs the one-time CoreSimulator
+      # cold-start here instead of in a throwaway diagnostic step.
+      - name: Start simulator boot (async)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           t0=$(date +%s)
-          xcodebuild -version
-          t1=$(date +%s); echo "[[TIMER]] xcodebuild_version $((t1-t0))s"
-          # First simctl call pays the one-time CoreSimulator service spin-up.
-          xcrun simctl list runtimes | grep -i ios || true
-          t2=$(date +%s); echo "[[TIMER]] first_simctl_list $((t2-t1))s"
+          UDID="$(xcrun simctl create ci-probe "$DEVICE")"
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          t1=$(date +%s); echo "[[TIMER]] create_plus_boot_return $((t1-t0))s"
 
-      # macOS runners ship the iOS SDK with Xcode, so on macOS xtool does NOT
-      # need our Linux Darwin-SDK dance. It builds against Xcode's SDK directly.
-      # Official macOS install is Homebrew (preinstalled on GitHub runners).
+      # macOS runners ship the iOS SDK with Xcode, so xtool builds against it
+      # directly (no Linux Darwin-SDK dance). Homebrew is preinstalled.
+      # This step runs WHILE the sim warms up.
       - name: Install xtool
         run: |
           set -euxo pipefail
@@ -57,38 +70,35 @@ jobs:
           echo "resolved APP_PATH=$APP_PATH"
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
-      - name: Boot simulator, install, launch, screenshot
-        env:
-          BUNDLE_ID: com.example.ScreenshotProbe
+      # By now the sim has had ~50s to warm. bootstatus should return fast, and
+      # install/launch should be quicker against an already-online sim.
+      - name: Wait for boot, install, launch, screenshot
         run: |
           set -euxo pipefail
           mkdir -p screenshots
-          DEVICE="iPhone 16 Pro"
 
           t0=$(date +%s)
-          UDID="$(xcrun simctl create ci-probe "$DEVICE" || true)"
-          [ -z "$UDID" ] && UDID="$(xcrun simctl list devices available | grep -Eo '[0-9A-F-]{36}' | head -1)"
-          echo "UDID=$UDID"
-          t1=$(date +%s); echo "[[TIMER]] simctl_create $((t1-t0))s"
-
-          xcrun simctl boot "$UDID" || true
-          t2=$(date +%s); echo "[[TIMER]] simctl_boot_return $((t2-t1))s"
-
           xcrun simctl bootstatus "$UDID" -b
-          t3=$(date +%s); echo "[[TIMER]] simctl_bootstatus_wait $((t3-t2))s"
+          t1=$(date +%s); echo "[[TIMER]] bootstatus_wait $((t1-t0))s"
 
-          echo "installing $APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
-          t4=$(date +%s); echo "[[TIMER]] simctl_install $((t4-t3))s"
+          t2=$(date +%s); echo "[[TIMER]] install $((t2-t1))s"
 
           xcrun simctl launch "$UDID" "$BUNDLE_ID"
-          t5=$(date +%s); echo "[[TIMER]] simctl_launch $((t5-t4))s"
+          t3=$(date +%s); echo "[[TIMER]] launch $((t3-t2))s"
 
-          sleep 6   # let SwiftUI render the first frame
-          xcrun simctl io "$UDID" screenshot screenshots/home.png
-          t6=$(date +%s); echo "[[TIMER]] sleep6_plus_screenshot $((t6-t5))s"
+          # Poll for a rendered first frame instead of a fixed sleep: screenshot,
+          # and if it's suspiciously tiny (blank), wait and retry a few times.
+          for i in 1 2 3 4 5; do
+            xcrun simctl io "$UDID" screenshot screenshots/home.png || true
+            sz=$(stat -f%z screenshots/home.png 2>/dev/null || echo 0)
+            echo "screenshot attempt $i: ${sz} bytes"
+            [ "$sz" -gt 100000 ] && break
+            sleep 2
+          done
+          t4=$(date +%s); echo "[[TIMER]] screenshot_poll $((t4-t3))s"
 
-          echo "[[TIMER]] boot_step_total $((t6-t0))s"
+          echo "[[TIMER]] finish_step_total $((t4-t0))s"
           ls -la screenshots
 
       - name: Upload screenshots
