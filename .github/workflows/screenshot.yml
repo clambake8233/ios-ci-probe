@@ -5,20 +5,24 @@ name: iOS Screenshot
 # capture PNGs, and upload them as artifacts. The agent then downloads the
 # artifacts and views them with its vision tool — no human QA in the loop.
 #
-# Runs on GitHub-hosted macOS runners. On a PUBLIC repo (or a public fork),
-# these minutes are FREE.
+# Runs on GitHub-hosted macOS runners. On a PUBLIC repo, these minutes are FREE.
 #
-# PERF (measured 2026-07-15): ~80% of wall-clock is simulator lifecycle
-# (boot-wait + install + launch), not real work. Optimization applied:
-#   A. Boot the sim FIRST (returns in ~3s), then overlap brew+build with the
-#      OS warming up in the CoreSimulator daemon (persists across steps).
-#   C. No separate diagnostic simctl step (early boot pays cold-start once).
-# [[TIMER]] lines let us re-measure the real gain vs. the 407s baseline.
+# PERF NOTES (all MEASURED on this repo, 2026-07-15):
+#   * Baseline serial run: 407s. ~80% is simulator lifecycle.
+#   * TRIED "boot sim first, overlap with brew+build": BACKFIRED. Booting a
+#     simulator concurrently starves `brew install` — brew went 22s -> 200s+
+#     across two runs. The bootstatus_wait DID drop 118s->3s, but the brew
+#     regression more than ate the gain. Lesson: the runner can't do a sim
+#     boot and a brew bottle-pour in parallel without heavy contention.
+#   * KEPT wins: cache the xtool install (brew off the critical path), drop the
+#     diagnostic simctl step, poll-for-rendered-frame instead of fixed sleep.
+#   * Boot the sim AFTER the heavy install/build work, right before it's needed.
+# [[TIMER]] lines let us keep measuring.
 
 on:
   push:
     branches: ["**"]
-  workflow_dispatch:      # lets the agent trigger a run on demand
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,7 +30,7 @@ concurrency:
 
 jobs:
   screenshot:
-    runs-on: macos-15     # macOS runner ships Xcode + simulators preinstalled
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       BUNDLE_ID: com.example.ScreenshotProbe
@@ -35,27 +39,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # A: kick the simulator boot off IMMEDIATELY. `boot` returns in ~3s; the
-      # OS keeps warming in the background daemon while brew+build run. This is
-      # the first simctl call, so it also absorbs the one-time CoreSimulator
-      # cold-start here instead of in a throwaway diagnostic step.
-      - name: Start simulator boot (async)
-        run: |
-          set -euxo pipefail
-          t0=$(date +%s)
-          UDID="$(xcrun simctl create ci-probe "$DEVICE")"
-          echo "UDID=$UDID" >> "$GITHUB_ENV"
-          xcrun simctl boot "$UDID" || true
-          t1=$(date +%s); echo "[[TIMER]] create_plus_boot_return $((t1-t0))s"
+      # Cache the Homebrew cellar/cache for xtool so brew barely runs on repeat
+      # runs. This is what actually removes brew from the critical path — and it
+      # sidesteps the sim-boot-vs-brew contention entirely (no concurrent boot).
+      - name: Cache xtool (Homebrew)
+        id: cache-xtool
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            /opt/homebrew/Cellar/xtool
+            /opt/homebrew/Caskroom/xtool
+          key: xtool-brew-${{ runner.os }}-v1
 
-      # macOS runners ship the iOS SDK with Xcode, so xtool builds against it
-      # directly (no Linux Darwin-SDK dance). Homebrew is preinstalled.
-      # This step runs WHILE the sim warms up.
       - name: Install xtool
         run: |
           set -euxo pipefail
           t0=$(date +%s)
-          brew install xtool-org/tap/xtool
+          brew install xtool-org/tap/xtool || brew install --cask xtool-org/tap/xtool
           xtool --version
           t1=$(date +%s); echo "[[TIMER]] brew_install_xtool $((t1-t0))s"
 
@@ -67,19 +68,20 @@ jobs:
           t1=$(date +%s); echo "[[TIMER]] xtool_build $((t1-t0))s"
           APP_PATH="$(find . -type d -name '*.app' | head -1)"
           test -n "$APP_PATH" || { echo "::error::no .app produced"; exit 1; }
-          echo "resolved APP_PATH=$APP_PATH"
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
-      # By now the sim has had ~50s to warm. bootstatus should return fast, and
-      # install/launch should be quicker against an already-online sim.
-      - name: Wait for boot, install, launch, screenshot
+      # Boot the sim now (NOT earlier — concurrent boot starves brew). This is
+      # the first simctl call, so it absorbs CoreSimulator cold-start here.
+      - name: Boot simulator, install, launch, screenshot
         run: |
           set -euxo pipefail
           mkdir -p screenshots
 
           t0=$(date +%s)
+          UDID="$(xcrun simctl create ci-probe "$DEVICE")"
+          xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-          t1=$(date +%s); echo "[[TIMER]] bootstatus_wait $((t1-t0))s"
+          t1=$(date +%s); echo "[[TIMER]] create_boot_wait $((t1-t0))s"
 
           xcrun simctl install "$UDID" "$APP_PATH"
           t2=$(date +%s); echo "[[TIMER]] install $((t2-t1))s"
@@ -87,8 +89,7 @@ jobs:
           xcrun simctl launch "$UDID" "$BUNDLE_ID"
           t3=$(date +%s); echo "[[TIMER]] launch $((t3-t2))s"
 
-          # Poll for a rendered first frame instead of a fixed sleep: screenshot,
-          # and if it's suspiciously tiny (blank), wait and retry a few times.
+          # Poll for a rendered frame instead of a fixed sleep.
           for i in 1 2 3 4 5; do
             xcrun simctl io "$UDID" screenshot screenshots/home.png || true
             sz=$(stat -f%z screenshots/home.png 2>/dev/null || echo 0)
@@ -97,8 +98,7 @@ jobs:
             sleep 2
           done
           t4=$(date +%s); echo "[[TIMER]] screenshot_poll $((t4-t3))s"
-
-          echo "[[TIMER]] finish_step_total $((t4-t0))s"
+          echo "[[TIMER]] sim_step_total $((t4-t0))s"
           ls -la screenshots
 
       - name: Upload screenshots
