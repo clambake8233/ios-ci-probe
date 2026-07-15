@@ -18,11 +18,19 @@ name: iOS Screenshot
 #     sees "artifact has not changed" and SKIPS linking -> `xtool: command
 #     not found` (exit 127). And it was pointless: with the concurrent boot
 #     removed, a COLD brew install is only 11s. Cache deleted.
-#   * KEPT wins (measured): drop the diagnostic simctl step, poll-for-rendered
-#     -frame instead of fixed sleep, boot the sim serially AFTER install+build.
-#   * RESULT: 407s -> 212s (48% faster), reproducible + green. The remaining
-#     152s is simulator lifecycle (create/boot/install/launch), largely
-#     irreducible on ephemeral runners. [[TIMER]] lines keep us honest.
+#   * KEPT wins (measured, STABLE): drop the diagnostic simctl step,
+#     poll-for-rendered-frame instead of fixed sleep, boot the sim serially
+#     AFTER install+build. brew=11s and xtool_build=14-18s reproducibly.
+#   * RESULT: the CONTROLLABLE cost is minimized and stable (~25s brew+build).
+#     But the DOMINANT cost — simulator lifecycle (create/boot/install/launch)
+#     — is high-variance on ephemeral runners: measured 152s AND 276s across
+#     two identical green runs (JOB total 212s vs 329s). So there is no single
+#     "optimized wall-clock" number; it swings with runner contention and
+#     first-launch SpringBoard warm-up. ~72-84% of every run is sim lifecycle.
+#   * To get a STABLE fast loop you must leave the sim lifecycle behind — i.e.
+#     a snapshot-render harness (ImageRenderer / swift-snapshot-testing) that
+#     renders SwiftUI without booting a simulator. Deferred until a real app.
+#   * [[TIMER]] lines keep every claim measured, not asserted.
 
 on:
   push:
