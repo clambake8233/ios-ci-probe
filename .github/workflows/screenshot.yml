@@ -1,0 +1,80 @@
+name: iOS Screenshot
+
+# Screenshot loop the agent can SEE: build the SwiftUI app for the iOS
+# Simulator on a macOS runner (real Xcode + real iOS runtime), launch it,
+# capture PNGs, and upload them as artifacts. The agent then downloads the
+# artifacts and views them with its vision tool — no human QA in the loop.
+#
+# Runs on GitHub-hosted macOS runners. On a PUBLIC repo (or a public fork),
+# these minutes are FREE.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:      # lets the agent trigger a run on demand
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screenshot:
+    runs-on: macos-15     # macOS runner ships Xcode + simulators preinstalled
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode + simulator runtimes
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes | grep -i ios || true
+
+      # macOS runners ship the iOS SDK with Xcode, so on macOS xtool does NOT
+      # need our Linux Darwin-SDK dance. It builds against Xcode's SDK directly.
+      # Official macOS install is Homebrew (preinstalled on GitHub runners).
+      - name: Install xtool
+        run: |
+          set -euxo pipefail
+          brew install xtool-org/tap/xtool
+          xtool --version
+
+      - name: Build app for iOS Simulator
+        run: |
+          set -euxo pipefail
+          xtool dev build --triple arm64-apple-ios-simulator
+          echo "APP_PATH=$(find . -type d -name '*.app' -path '*imulator*' | head -1)" >> "$GITHUB_ENV"
+          test -n "$APP_PATH" || APP_PATH="$(find . -type d -name '*.app' | head -1)"
+          echo "resolved APP_PATH=$APP_PATH"
+
+      - name: Boot simulator, install, launch, screenshot
+        env:
+          BUNDLE_ID: com.example.ScreenshotProbe
+        run: |
+          set -euxo pipefail
+          mkdir -p screenshots
+          # Pick an available iPhone device type + latest iOS runtime.
+          DEVICE="iPhone 16 Pro"
+          UDID="$(xcrun simctl create ci-probe "$DEVICE" || true)"
+          [ -z "$UDID" ] && UDID="$(xcrun simctl list devices available | grep -Eo '[0-9A-F-]{36}' | head -1)"
+          echo "UDID=$UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          APP_PATH="$(find . -type d -name '*.app' | head -1)"
+          echo "installing $APP_PATH"
+          xcrun simctl install "$UDID" "$APP_PATH"
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          sleep 6   # let SwiftUI render the first frame
+          xcrun simctl io "$UDID" screenshot screenshots/home.png
+          # A second shot after a UI interaction (tap the button via a deep sleep+tap is
+          # overkill for the probe; the first frame already proves rendering).
+          ls -la screenshots
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-screenshots
+          path: screenshots/**
+          if-no-files-found: warn
+          retention-days: 7
