@@ -27,8 +27,13 @@ jobs:
 
       - name: Show Xcode + simulator runtimes
         run: |
+          set -euo pipefail
+          t0=$(date +%s)
           xcodebuild -version
+          t1=$(date +%s); echo "[[TIMER]] xcodebuild_version $((t1-t0))s"
+          # First simctl call pays the one-time CoreSimulator service spin-up.
           xcrun simctl list runtimes | grep -i ios || true
+          t2=$(date +%s); echo "[[TIMER]] first_simctl_list $((t2-t1))s"
 
       # macOS runners ship the iOS SDK with Xcode, so on macOS xtool does NOT
       # need our Linux Darwin-SDK dance. It builds against Xcode's SDK directly.
@@ -36,13 +41,17 @@ jobs:
       - name: Install xtool
         run: |
           set -euxo pipefail
+          t0=$(date +%s)
           brew install xtool-org/tap/xtool
           xtool --version
+          t1=$(date +%s); echo "[[TIMER]] brew_install_xtool $((t1-t0))s"
 
       - name: Build app for iOS Simulator
         run: |
           set -euxo pipefail
+          t0=$(date +%s)
           xtool dev build --triple arm64-apple-ios-simulator
+          t1=$(date +%s); echo "[[TIMER]] xtool_build $((t1-t0))s"
           APP_PATH="$(find . -type d -name '*.app' | head -1)"
           test -n "$APP_PATH" || { echo "::error::no .app produced"; exit 1; }
           echo "resolved APP_PATH=$APP_PATH"
@@ -54,18 +63,32 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p screenshots
-          # Pick an available iPhone device type + latest iOS runtime.
           DEVICE="iPhone 16 Pro"
+
+          t0=$(date +%s)
           UDID="$(xcrun simctl create ci-probe "$DEVICE" || true)"
           [ -z "$UDID" ] && UDID="$(xcrun simctl list devices available | grep -Eo '[0-9A-F-]{36}' | head -1)"
           echo "UDID=$UDID"
+          t1=$(date +%s); echo "[[TIMER]] simctl_create $((t1-t0))s"
+
           xcrun simctl boot "$UDID" || true
+          t2=$(date +%s); echo "[[TIMER]] simctl_boot_return $((t2-t1))s"
+
           xcrun simctl bootstatus "$UDID" -b
+          t3=$(date +%s); echo "[[TIMER]] simctl_bootstatus_wait $((t3-t2))s"
+
           echo "installing $APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
+          t4=$(date +%s); echo "[[TIMER]] simctl_install $((t4-t3))s"
+
           xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          t5=$(date +%s); echo "[[TIMER]] simctl_launch $((t5-t4))s"
+
           sleep 6   # let SwiftUI render the first frame
           xcrun simctl io "$UDID" screenshot screenshots/home.png
+          t6=$(date +%s); echo "[[TIMER]] sleep6_plus_screenshot $((t6-t5))s"
+
+          echo "[[TIMER]] boot_step_total $((t6-t0))s"
           ls -la screenshots
 
       - name: Upload screenshots
