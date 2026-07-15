@@ -43,9 +43,10 @@ jobs:
         run: |
           set -euxo pipefail
           xtool dev build --triple arm64-apple-ios-simulator
-          echo "APP_PATH=$(find . -type d -name '*.app' -path '*imulator*' | head -1)" >> "$GITHUB_ENV"
-          test -n "$APP_PATH" || APP_PATH="$(find . -type d -name '*.app' | head -1)"
+          APP_PATH="$(find . -type d -name '*.app' | head -1)"
+          test -n "$APP_PATH" || { echo "::error::no .app produced"; exit 1; }
           echo "resolved APP_PATH=$APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
       - name: Boot simulator, install, launch, screenshot
         env:
@@ -60,14 +61,11 @@ jobs:
           echo "UDID=$UDID"
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
-          APP_PATH="$(find . -type d -name '*.app' | head -1)"
           echo "installing $APP_PATH"
           xcrun simctl install "$UDID" "$APP_PATH"
           xcrun simctl launch "$UDID" "$BUNDLE_ID"
           sleep 6   # let SwiftUI render the first frame
           xcrun simctl io "$UDID" screenshot screenshots/home.png
-          # A second shot after a UI interaction (tap the button via a deep sleep+tap is
-          # overkill for the probe; the first frame already proves rendering).
           ls -la screenshots
 
       - name: Upload screenshots
